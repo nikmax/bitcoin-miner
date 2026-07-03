@@ -1,8 +1,10 @@
 # Miner Worker
 
 ## Abhängigkeiten installieren
+```bash
 wenn du GPU hast:
 sudo apt update && sudo apt install -y python3-flask python3-numpy 
+```
 
 ```bash
 cd worker
