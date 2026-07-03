@@ -1,7 +1,7 @@
 {
   "master_url": "http://192.168.1.10:8080",
-  "worker_token": "change-this-long-random-token",
   "worker_name": "rtx-worker-1",
+  "worker_token": "front-phonics-wand-resident-consuming-unhinge-setback-motion-detached-abnormal-saturate-oink",
   "use_gpu": true,
   "gpu_batch_size": 262144,
   "gpu_platform_substring": "nvidia",
