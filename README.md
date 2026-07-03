@@ -1,27 +1,33 @@
-# Miner Worker Final 1.4
-
-Kompatibilitäts-Update für Master 3.0.
-
-## Änderungen
-
-- Worker sendet `worker_name` jetzt nicht nur beim Register, sondern auch bei:
-  - Job-Anfrage
-  - Heartbeat
-  - Blockfund
-- Dadurch bleibt der Anzeigename stabil, auch wenn der Master neu gestartet wird, während Worker weiterlaufen.
-- Permanente `worker_id` bleibt technische Identität.
-- Der Master lehnt weiterhin zweite aktive Instanzen mit gleichem `worker_name` ab.
+# Miner Worker
 
 ## Start
 
 ```bash
-cd miner_worker_final_1_4/worker
+cd worker
 cp config.example.json config.json
+
+anpassen: nano config.json
+  - Adresse deines Pools inkl. Port -> master_url
+  - Deine Bitcoinadresse (wichtig!) -> worker_name
+
 python3 worker.py
 ```
 
+```
 Lokales Dashboard:
 
 ```text
-http://WORKER-IP:8090
+http://127.0.0.1:8090
+```
+
+Standard-Worker-Dashboard-Login aus Beispielconfig:
+
+```text
+worker / change-me
+```
+
+Hash erzeugen:
+
+```bash
+python3 ../tools/hash_password.py
 ```
