@@ -1,19 +1,19 @@
 {
   "master_url": "http://192.168.1.10:8080",
-  "worker_token": "catalyst-antarctic-brussels-buddy-backup-tutor-briar-playmate-numerous-channel-slain-scrambler",
-  "worker_name": "bc1quwr5vhct5th95lywszej79392qahux4qj0tljs",
+  "worker_token": "change-this-long-random-token",
+  "worker_name": "rtx-worker-1",
   "use_gpu": true,
   "gpu_batch_size": 262144,
   "gpu_platform_substring": "nvidia",
   "gpu_device_substring": "",
   "cpu_batch_size": 50000,
   "gpu_local_size": 128,
-  "note": "Final Worker 1.4: permanente worker_id, eindeutiger worker_name im Master, lokale Block-Beteiligungshistorie mit paid=no.",
+  "note": "Final Worker 1.5.4: CPU-Fallback, Nonce-Range-Debugging, robuste Master-API-Fehlerbehandlung, Config-Editor im Worker-Dashboard.",
   "worker_dashboard_enabled": true,
   "worker_dashboard_host": "127.0.0.1",
   "worker_dashboard_port": 8090,
   "max_gpu_temp_c": 78,
-  "version": "worker-final-1.4",
+  "version": "worker-final-1.5.4",
   "thermal_resume_temp_c": 70,
   "thermal_poll_seconds": 3,
   "worker_dashboard_auth_enabled": true,
@@ -21,5 +21,7 @@
   "worker_dashboard_password_hash": "e2186dbdb1bb4193608605e84f33208765b5693b55edd4f730a719a100eeea6f",
   "worker_dashboard_auth_note": "Standardpasswort ist change-me. Bitte mit tools/hash_password.py ändern.",
   "worker_id": "",
-  "worker_history_limit": 100
+  "worker_history_limit": 100,
+  "backend": "auto",
+  "register_retry_seconds": 10
 }

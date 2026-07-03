@@ -26,6 +26,7 @@ LOCAL_STATE = {
     "hashrate_hs": 0.0, "verified_hashrate_hs": 0.0, "cluster_hashrate_hs": 0.0, "share_percent": 0.0,
     "total_hashes": 0, "nonce": None, "batch_size": None, "local_size": None,
     "completed_batches": 0, "last_interval_hashes": 0, "last_interval_seconds": 0.0,
+    "nonce_start": None, "nonce_end": None, "job_progress_percent": 0.0, "job_end_reason": None,
     "gpu_metrics": [], "max_gpu_temp_c": None, "thermal_stop": False,
     "last_error": None, "last_update": None, "logs": [],
     "block_history": [], "history_summary": {},
@@ -170,6 +171,12 @@ def _json_response(resp, url):
     content_type = resp.headers.get("content-type", "")
     if resp.status_code >= 400:
         snippet = text.strip().replace("\n", " ")[:240]
+        if resp.status_code in (401, 403):
+            raise PermissionError(
+                f"Master API nicht autorisiert ({resp.status_code}) bei {url}. "
+                "Bitte worker_token in worker/config.json und master/config.json vergleichen. "
+                f"Antwort: {snippet or 'leere Antwort'}"
+            )
         raise RuntimeError(f"Master API HTTP {resp.status_code} bei {url}: {snippet or 'leere Antwort'}")
     try:
         return resp.json()
@@ -290,7 +297,12 @@ class GpuHasher:
         return None
 
 def make_hasher(c):
-    if not c.get("use_gpu", True):
+    # Worker Final 1.5.2:
+    # backend=cpu   -> keine GPU/OpenCL-Initialisierung
+    # backend=auto  -> GPU versuchen, sonst CPU-Fallback
+    # backend=opencl/gpu -> GPU versuchen, bei Fehler CPU-Fallback
+    backend_cfg = str(c.get("backend", "auto")).lower().strip()
+    if backend_cfg in ("cpu", "none") or not c.get("use_gpu", True):
         return None, "cpu", None
     try:
         h = GpuHasher(
@@ -301,7 +313,7 @@ def make_hasher(c):
         )
         return h, "opencl", h.device_name
     except Exception as e:
-        print("GPU nicht verfügbar, CPU-Fallback:", e)
+        print("GPU/OpenCL nicht verfügbar, CPU-Fallback:", e)
         return None, "cpu", None
 
 def register(c, worker_id, backend, gpu_device):
@@ -309,7 +321,33 @@ def register(c, worker_id, backend, gpu_device):
     res = post(c, API_REGISTER, payload)
     if not res.get("ok"):
         raise RuntimeError(res)
-    update_local(status=STATUS_REGISTERED, gpu_metrics=payload["gpus"], batch_size=payload["batch_size"], local_size=payload["local_size"])
+    update_local(status=STATUS_REGISTERED, gpu_metrics=payload["gpus"], batch_size=payload["batch_size"], local_size=payload["local_size"], last_error=None)
+    return res
+
+def register_until_ok(c, worker_id, backend, gpu_device):
+    """Register worker without crashing the process.
+
+    Dashboard starts first and remains reachable. If the master rejects the
+    worker_token (401/403) or the master is temporarily unavailable, the worker
+    keeps running in an idle/error state and retries periodically.
+    """
+    retry_seconds = float(c.get("register_retry_seconds", 10))
+    while True:
+        if WORKER_STOP.is_set():
+            update_local(status="local_stop", hashrate_hs=0.0, verified_hashrate_hs=0.0)
+        try:
+            res = register(c, worker_id, backend, gpu_device)
+            local_log(f"Beim Master registriert: {res}")
+            return res
+        except PermissionError as e:
+            msg = str(e)
+            update_local(status="auth_error", master_running=False, hashrate_hs=0.0, verified_hashrate_hs=0.0, last_error=msg)
+            local_log(f"Registrierung abgelehnt: {msg}")
+        except Exception as e:
+            msg = str(e)
+            update_local(status="register_error", master_running=False, hashrate_hs=0.0, verified_hashrate_hs=0.0, last_error=msg)
+            local_log(f"Registrierung fehlgeschlagen: {msg}")
+        time.sleep(max(2.0, retry_seconds))
 
 def heartbeat(c, worker_id, backend, job_id=None, hashrate=0.0, total_hashes=0, nonce=None, status=STATUS_MINING,
               completed_batches=0, last_interval_hashes=0, last_interval_seconds=0.0):
@@ -350,20 +388,22 @@ def heartbeat(c, worker_id, backend, job_id=None, hashrate=0.0, total_hashes=0, 
 def mine_job_cpu(job, c, worker_id, backend):
     prefix = bytes.fromhex(job["header_prefix_hex"])
     target = int(job["target_hex"], 16)
-    nonce = 0
+    nonce_start = int(job.get("nonce_start", 0) or 0)
+    nonce_end = int(job.get("nonce_end", 0xffffffff) or 0xffffffff)
+    nonce = nonce_start
     batch = int(c.get("cpu_batch_size", 50000))
     total = 0
     last = time.time()
     last_total = 0
-    while nonce <= 0xffffffff and not WORKER_STOP.is_set():
+    while nonce <= nonce_end and not WORKER_STOP.is_set():
         if not safety_check(c):
             r = heartbeat(c, worker_id, backend, job["job_id"], 0.0, total, nonce, status="thermal_pause",
                           completed_batches=0, last_interval_hashes=0, last_interval_seconds=0.0)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total
+                return None, total, "template_changed_or_stopped"
             last, last_total = time.time(), total
             continue
-        end = min(0x100000000, nonce + batch)
+        end = min(nonce_end + 1, nonce + batch)
         for n in range(nonce, end):
             h = sha256d(prefix + struct.pack("<I", n))
             if int.from_bytes(h[::-1], "big") < target:
@@ -377,7 +417,7 @@ def mine_job_cpu(job, c, worker_id, backend):
                               completed_batches=0, last_interval_hashes=interval_hashes, last_interval_seconds=interval_seconds)
                 except Exception as e:
                     local_log(f"Heartbeat bei Fund fehlgeschlagen: {e}")
-                return n, found_total
+                return n, found_total, "found"
         done = end - nonce
         nonce = end
         total += done
@@ -388,28 +428,34 @@ def mine_job_cpu(job, c, worker_id, backend):
             hr = interval_hashes / interval_seconds
             r = heartbeat(c, worker_id, backend, job["job_id"], hr, total, nonce, completed_batches=0, last_interval_hashes=interval_hashes, last_interval_seconds=interval_seconds)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total
+                return None, total, "template_changed_or_stopped"
+            # Progress is purely local UI data.
+            span = max(1, nonce_end - nonce_start + 1)
+            update_local(job_progress_percent=min(100.0, max(0.0, (nonce - nonce_start) / span * 100.0)), nonce_start=nonce_start, nonce_end=nonce_end)
             last, last_total = now, total
-    return None, total
+    if WORKER_STOP.is_set():
+        return None, total, "local_stop"
+    return None, total, "range_exhausted"
 
 def mine_job_gpu(job, c, worker_id, backend, hasher):
     prefix = bytes.fromhex(job["header_prefix_hex"])
     hasher.prepare_target(job["target_hex"])
-    nonce = 0
+    nonce_start = int(job.get("nonce_start", 0) or 0)
+    nonce_end = int(job.get("nonce_end", 0xffffffff) or 0xffffffff)
+    nonce = nonce_start
     total = 0
     completed_batches = 0
     last = time.time()
     last_total = 0
-    last_batches = 0
-    while nonce <= 0xffffffff and not WORKER_STOP.is_set():
+    while nonce <= nonce_end and not WORKER_STOP.is_set():
         if not safety_check(c):
             r = heartbeat(c, worker_id, backend, job["job_id"], 0.0, total, nonce, status="thermal_pause",
                           completed_batches=completed_batches, last_interval_hashes=0, last_interval_seconds=0.0)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total
+                return None, total, "template_changed_or_stopped"
             last, last_total = time.time(), total
             continue
-        count = min(hasher.batch_size, 0x100000000 - nonce)
+        count = min(hasher.batch_size, nonce_end + 1 - nonce)
         found = hasher.scan_batch(prefix, nonce, count)
         nonce += count
         total += count
@@ -424,7 +470,7 @@ def mine_job_gpu(job, c, worker_id, backend, hasher):
                           completed_batches=completed_batches, last_interval_hashes=interval_hashes, last_interval_seconds=interval_seconds)
             except Exception as e:
                 local_log(f"Heartbeat bei Fund fehlgeschlagen: {e}")
-            return found, total
+            return found, total, "found"
         now = time.time()
         if now - last >= 2:
             interval_hashes = total - last_total
@@ -432,9 +478,14 @@ def mine_job_gpu(job, c, worker_id, backend, hasher):
             hr = interval_hashes / interval_seconds
             r = heartbeat(c, worker_id, backend, job["job_id"], hr, total, nonce, completed_batches=completed_batches, last_interval_hashes=interval_hashes, last_interval_seconds=interval_seconds)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total
+                return None, total, "template_changed_or_stopped"
+            # Progress is purely local UI data.
+            span = max(1, nonce_end - nonce_start + 1)
+            update_local(job_progress_percent=min(100.0, max(0.0, (nonce - nonce_start) / span * 100.0)), nonce_start=nonce_start, nonce_end=nonce_end)
             last, last_total = now, total
-    return None, total
+    if WORKER_STOP.is_set():
+        return None, total, "local_stop"
+    return None, total, "range_exhausted"
 
 
 def run_local_benchmark(duration_seconds=15, batch_size=None):
@@ -506,10 +557,10 @@ def run_local_benchmark(duration_seconds=15, batch_size=None):
 
 WORKER_HTML = r"""
 <!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Miner Worker Final 1.2</title><style>
+<title>Miner Worker Final 1.5.4</title><style>
 body{font-family:system-ui,Arial;background:#0b1020;color:#e8eefc;margin:0}header{padding:16px 22px;background:#111936;border-bottom:1px solid #26345f}.wrap{padding:18px;max-width:1100px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.card{background:#111936;border:1px solid #26345f;border-radius:14px;padding:14px;margin-bottom:12px}.label{color:#9fb0d0;font-size:.85rem}.value{font-size:1.5rem;font-weight:700}.ok{color:#34d399}.bad{color:#fb7185}.warn{color:#fbbf24}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #26345f;text-align:left}.bar{height:12px;background:#26345f;border-radius:8px;overflow:hidden}.bar>span{display:block;height:12px;background:#34d399}.small{font-size:.85rem;color:#9fb0d0}.log{height:190px;overflow:auto;background:#0b1020;border-radius:10px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#26345f;font-size:.8rem}a{color:#93c5fd}button{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;margin-right:8px;cursor:pointer}.danger{background:#dc2626}.warnbtn{background:#d97706}
-</style></head><body><header><b>Miner Worker Final 1.2</b> <span id="state"></span></header><div class="wrap">
-<div class="card"><button onclick="fetch('/start',{method:'POST'}).then(r=>r.json()).then(x=>alert(x.message||JSON.stringify(x)))">Start / Resume</button> <button onclick="fetch('/stop',{method:'POST'}).then(r=>r.json()).then(x=>alert(x.message||JSON.stringify(x)))" class="warnbtn">Stop Mining</button> <button onclick="if(confirm('Worker-Prozess wirklich beenden?')) fetch('/quit',{method:'POST'}).then(r=>r.json()).then(x=>alert(x.message||JSON.stringify(x)))" class="danger">Quit</button> <button onclick="fetch('/benchmark',{method:'POST'}).then(r=>r.json()).then(x=>alert(JSON.stringify(x,null,2)))">Lokalen Kurztest starten</button><p class="small">Stop hält nur das Rechnen lokal an. Start nimmt denselben Worker wieder auf. Quit beendet den Prozess.</p></div>
+</style></head><body><header><b>Miner Worker Final 1.5.4</b> <span id="state"></span></header><div class="wrap">
+<div class="card"><button onclick="fetch('/start',{method:'POST'}).then(r=>r.json()).then(x=>alert(x.message||JSON.stringify(x)))">Start / Resume</button> <button onclick="fetch('/stop',{method:'POST'}).then(r=>r.json()).then(x=>alert(x.message||JSON.stringify(x)))" class="warnbtn">Stop Mining</button> <button onclick="if(confirm('Worker-Prozess wirklich beenden?')) fetch('/quit',{method:'POST'}).then(r=>r.json()).then(x=>alert(x.message||JSON.stringify(x)))" class="danger">Quit</button> <button onclick="fetch('/benchmark',{method:'POST'}).then(r=>r.json()).then(x=>alert(JSON.stringify(x,null,2)))">Lokalen Kurztest starten</button> <a href="/config"><button>Config</button></a><p class="small">Stop hält nur das Rechnen lokal an. Start nimmt denselben Worker wieder auf. Quit beendet den Prozess.</p></div>
 <div class="grid"><div class="card"><div class="label">Eigene Hashrate</div><div id="hr" class="value">-</div></div><div class="card"><div class="label">Cluster-Hashrate</div><div id="chr" class="value">-</div></div><div class="card"><div class="label">Mein Anteil</div><div id="share" class="value">-</div></div><div class="card"><div class="label">Status</div><div id="st" class="value">-</div></div></div>
 <div class="card"><h3>Anteil am Cluster</h3><div class="bar"><span id="sharebar" style="width:0%"></span></div><p class="small">Zeigt den Anteil dieses Workers an der aktuell vom Master gemeldeten Gesamt-Hashrate.</p></div>
 <div class="card"><h3>Safety / Verifikation</h3><table><tbody id="verify"></tbody></table></div>
@@ -524,10 +575,60 @@ function fmt(n){n=Number(n||0); if(n>1e9)return (n/1e9).toFixed(2)+' GH/s'; if(n
 function fmtHash(n){n=Number(n||0); if(n>1e12)return (n/1e12).toFixed(2)+' TH'; if(n>1e9)return (n/1e9).toFixed(2)+' GH'; if(n>1e6)return (n/1e6).toFixed(2)+' MH'; if(n>1e3)return (n/1e3).toFixed(2)+' kH'; return n.toFixed(0)}
 async function loadHistory(){try{let h=await(await fetch('/api/history')).json();let rows=h.blocks||[];let sm=h.summary||{};document.getElementById('hist_summary').textContent=`Blöcke: ${sm.block_count||0} · Gesamt eigener Beitrag: ${fmtHash(sm.worker_verified_hashes||0)} · Ø Anteil: ${Number(sm.overall_share_percent||0).toFixed(2)}%`;document.getElementById('history').innerHTML=rows.map(b=>`<tr><td>${esc(b.height)}</td><td>${esc(b.ended_at||'')}</td><td>${fmtHash(b.worker_verified_hashes)}</td><td>${fmtHash(b.cluster_verified_hashes)}</td><td>${Number(b.worker_share_percent||0).toFixed(2)}%</td><td>${esc(b.paid||'no')}</td></tr>`).join('')||'<tr><td colspan="6">Noch keine Beteiligungen gefunden.</td></tr>'}catch(e){document.getElementById('hist_summary').textContent='Historie nicht erreichbar: '+e}}
 
-async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('state').innerHTML=s.master_running?'<span class="ok">● MASTER RUNNING</span>':'<span class="warn">● MASTER STOPPED/UNBEKANNT</span>';document.getElementById('hr').textContent=fmt(s.hashrate_hs);document.getElementById('chr').textContent=fmt(s.cluster_hashrate_hs);document.getElementById('share').textContent=(s.share_percent||0).toFixed(1)+'%';document.getElementById('sharebar').style.width=Math.max(0,Math.min(100,s.share_percent||0))+'%';document.getElementById('st').textContent=s.status||'-';document.getElementById('verify').innerHTML=`<tr><td>Verifizierte Hashrate</td><td><b>${fmt(s.verified_hashrate_hs||0)}</b></td></tr><tr><td>Letztes Intervall</td><td>${Number(s.last_interval_hashes||0).toLocaleString()} Nonces in ${Number(s.last_interval_seconds||0).toFixed(3)}s</td></tr><tr><td>Abgeschlossene GPU-Batches</td><td>${Number(s.completed_batches||0).toLocaleString()}</td></tr><tr><td>Temperatur-Limit</td><td>${esc(s.max_gpu_temp_c)}°C ${s.thermal_stop?'<span class="bad">THERMAL STOP</span>':''}</td></tr>`;document.getElementById('info').innerHTML=`<tr><td>Name</td><td><b>${esc(s.name)}</b></td></tr><tr><td>Worker-ID</td><td>${esc(s.worker_id)}</td></tr><tr><td>Master</td><td>${esc(s.master_url)}</td></tr><tr><td>Backend</td><td>${esc(s.backend)}</td></tr><tr><td>GPU</td><td>${esc(s.gpu_device)}</td></tr><tr><td>Job</td><td>${esc(s.job_id)} · Height ${esc(s.height)} · ExtraNonce ${esc(s.extranonce)}</td></tr><tr><td>Nonce</td><td>${esc(s.nonce)}</td></tr><tr><td>Hashes</td><td>${Number(s.total_hashes||0).toLocaleString()}</td></tr><tr><td>Tuning</td><td><span class="pill">Batch ${esc(s.batch_size)}</span> <span class="pill">Local ${esc(s.local_size)}</span></td></tr><tr><td>Letztes Update</td><td>${esc(s.last_update)}</td></tr>`;document.getElementById('gpu').innerHTML=(s.gpu_metrics||[]).map(g=>`<tr><td>${esc(g.name)}</td><td>${esc(g.temp_c)}°C</td><td>${esc(g.util_percent)}%</td><td>${esc(g.power_w)}W</td><td>${esc(g.pstate)}</td><td>${esc(g.mem_used_mb)}/${esc(g.mem_total_mb)} MB</td></tr>`).join('')||'<tr><td colspan="6">Keine GPU-Metriken</td></tr>';document.getElementById('logs').innerHTML=(s.logs||[]).slice(-100).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('err').textContent=s.last_error||''}
+async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('state').innerHTML=s.master_running?'<span class="ok">● MASTER RUNNING</span>':'<span class="warn">● MASTER STOPPED/UNBEKANNT</span>';document.getElementById('hr').textContent=fmt(s.hashrate_hs);document.getElementById('chr').textContent=fmt(s.cluster_hashrate_hs);document.getElementById('share').textContent=(s.share_percent||0).toFixed(1)+'%';document.getElementById('sharebar').style.width=Math.max(0,Math.min(100,s.share_percent||0))+'%';document.getElementById('st').textContent=s.status||'-';document.getElementById('verify').innerHTML=`<tr><td>Verifizierte Hashrate</td><td><b>${fmt(s.verified_hashrate_hs||0)}</b></td></tr><tr><td>Letztes Intervall</td><td>${Number(s.last_interval_hashes||0).toLocaleString()} Nonces in ${Number(s.last_interval_seconds||0).toFixed(3)}s</td></tr><tr><td>Abgeschlossene GPU-Batches</td><td>${Number(s.completed_batches||0).toLocaleString()}</td></tr><tr><td>Temperatur-Limit</td><td>${esc(s.max_gpu_temp_c)}°C ${s.thermal_stop?'<span class="bad">THERMAL STOP</span>':''}</td></tr>`;document.getElementById('info').innerHTML=`<tr><td>Name</td><td><b>${esc(s.name)}</b></td></tr><tr><td>Worker-ID</td><td>${esc(s.worker_id)}</td></tr><tr><td>Master</td><td>${esc(s.master_url)}</td></tr><tr><td>Backend</td><td>${esc(s.backend)}</td></tr><tr><td>GPU</td><td>${esc(s.gpu_device)}</td></tr><tr><td>Job</td><td>${esc(s.job_id)} · Height ${esc(s.height)} · ExtraNonce ${esc(s.extranonce)}</td></tr><tr><td>Nonce</td><td>${esc(s.nonce)}</td></tr><tr><td>Nonce-Range</td><td>${esc(s.nonce_start)} – ${esc(s.nonce_end)} · ${Number(s.job_progress_percent||0).toFixed(2)}%</td></tr><tr><td>Job-Ende</td><td>${esc(s.job_end_reason)}</td></tr><tr><td>Hashes</td><td>${Number(s.total_hashes||0).toLocaleString()}</td></tr><tr><td>Tuning</td><td><span class="pill">Batch ${esc(s.batch_size)}</span> <span class="pill">Local ${esc(s.local_size)}</span></td></tr><tr><td>Letztes Update</td><td>${esc(s.last_update)}</td></tr>`;document.getElementById('gpu').innerHTML=(s.gpu_metrics||[]).map(g=>`<tr><td>${esc(g.name)}</td><td>${esc(g.temp_c)}°C</td><td>${esc(g.util_percent)}%</td><td>${esc(g.power_w)}W</td><td>${esc(g.pstate)}</td><td>${esc(g.mem_used_mb)}/${esc(g.mem_total_mb)} MB</td></tr>`).join('')||'<tr><td colspan="6">Keine GPU-Metriken</td></tr>';document.getElementById('logs').innerHTML=(s.logs||[]).slice(-100).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('err').textContent=s.last_error||''}
 setInterval(tick,1000);tick();loadHistory();setInterval(loadHistory,15000);</script></body></html>
 """
 
+
+CONFIG_HTML = r"""
+<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Worker Config</title><style>
+body{font-family:system-ui,Arial;background:#0b1020;color:#e8eefc;margin:0}.wrap{padding:18px;max-width:1000px;margin:auto}header{padding:16px 22px;background:#111936;border-bottom:1px solid #26345f}.card{background:#111936;border:1px solid #26345f;border-radius:14px;padding:14px;margin-bottom:12px}textarea{width:100%;min-height:620px;background:#050816;color:#e8eefc;border:1px solid #26345f;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px}button{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;margin-right:8px;cursor:pointer}.danger{background:#dc2626}.ok{color:#34d399}.bad{color:#fb7185}.small{color:#9fb0d0;font-size:.9rem}a{color:#93c5fd}pre{white-space:pre-wrap}
+</style></head><body><header><b>Worker Config</b> · <a href="/">Dashboard</a></header><div class="wrap">
+<div class="card"><p class="small">Bearbeitet die lokale <code>worker/config.json</code>. Änderungen wie <code>worker_dashboard_host</code>/<code>port</code> brauchen einen Worker-Neustart. Token/Name/Master-URL werden nach Speichern bei der nächsten Verbindung genutzt.</p><button onclick="saveCfg()">Speichern</button> <button onclick="reloadCfg()">Neu laden</button> <button class="danger" onclick="if(confirm('Worker wirklich beenden?')) fetch('/quit',{method:'POST'})">Quit</button><pre id="msg"></pre></div>
+<div class="card"><textarea id="cfg"></textarea></div>
+</div><script>
+function esc(x){return String(x??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function reloadCfg(){let r=await fetch('/api/config');let j=await r.json();if(j.ok){document.getElementById('cfg').value=JSON.stringify(j.config,null,2);document.getElementById('msg').innerHTML='<span class="ok">Config geladen.</span>'}else{document.getElementById('msg').innerHTML='<span class="bad">'+esc(j.error)+'</span>'}}
+async function saveCfg(){let txt=document.getElementById('cfg').value;let parsed;try{parsed=JSON.parse(txt)}catch(e){document.getElementById('msg').innerHTML='<span class="bad">Ungültiges JSON: '+esc(e.message)+'</span>';return}let r=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(parsed)});let j=await r.json();if(j.ok){document.getElementById('msg').innerHTML='<span class="ok">Gespeichert.</span> '+esc(j.message||'')}else{document.getElementById('msg').innerHTML='<span class="bad">'+esc(j.error||JSON.stringify(j))+'</span>'}}
+reloadCfg();
+</script></body></html>
+"""
+
+
+@app.route("/config")
+@require_worker_dashboard_auth
+def worker_config_page():
+    return render_template_string(CONFIG_HTML)
+
+@app.route("/api/config", methods=["GET"])
+@require_worker_dashboard_auth
+def worker_config_get():
+    try:
+        return jsonify({"ok": True, "config": load_config()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/config", methods=["POST"])
+@require_worker_dashboard_auth
+def worker_config_save():
+    try:
+        data = request.get_json(force=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "Config muss ein JSON-Objekt sein."}), 400
+        # Minimalprüfung: verhindern, dass versehentlich Pflichtfelder gelöscht werden.
+        required = ["master_url", "worker_token", "worker_name"]
+        missing = [k for k in required if not str(data.get(k, "")).strip()]
+        if missing:
+            return jsonify({"ok": False, "error": "Pflichtfelder fehlen/leer: " + ", ".join(missing)}), 400
+        save_json_config(CONFIG_PATH, data)
+        update_local(name=data.get("worker_name", LOCAL_STATE.get("worker_id")), master_url=data.get("master_url"),
+                     batch_size=data.get("gpu_batch_size"), local_size=data.get("gpu_local_size", 256),
+                     last_error=None)
+        local_log("Config über Worker-Dashboard gespeichert")
+        return jsonify({"ok": True, "message": "Config gespeichert. Laufende GPU/Backend-Änderungen erfordern ggf. Worker-Neustart."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/api/benchmark", methods=["GET"])
 @require_worker_dashboard_auth
@@ -632,7 +733,7 @@ def main():
     update_local(worker_id=worker_id, name=c.get("worker_name", worker_id), backend=backend, gpu_device=gpu_device, master_url=c.get("master_url"), batch_size=c.get("gpu_batch_size"), local_size=c.get("gpu_local_size", 256))
     start_worker_dashboard(c)
     local_log(f"Worker: {worker_id} Backend: {backend} GPU: {gpu_device}")
-    register(c, worker_id, backend, gpu_device)
+    register_until_ok(c, worker_id, backend, gpu_device)
     total_all = 0
     while True:
         try:
@@ -657,13 +758,27 @@ def main():
                 time.sleep(2)
                 continue
             job = res["job"]
-            update_local(status=STATUS_MINING, job_id=job["job_id"], height=job.get("height"), extranonce=job.get("extranonce"), master_running=True)
-            local_log(f"Job {job['job_id']} Height {job['height']} ExtraNonce {job['extranonce']}")
+            nonce_start = int(job.get("nonce_start", 0) or 0)
+            nonce_end = int(job.get("nonce_end", 0xffffffff) or 0xffffffff)
+            update_local(status=STATUS_MINING, job_id=job["job_id"], height=job.get("height"), extranonce=job.get("extranonce"),
+                         master_running=True, nonce_start=nonce_start, nonce_end=nonce_end, job_progress_percent=0.0, job_end_reason=None)
+            local_log(f"Job {job['job_id']} Height {job['height']} ExtraNonce {job['extranonce']} NonceRange {nonce_start}-{nonce_end}")
             if hasher:
-                found_nonce, tries = mine_job_gpu(job, c, worker_id, backend, hasher)
+                found_nonce, tries, end_reason = mine_job_gpu(job, c, worker_id, backend, hasher)
             else:
-                found_nonce, tries = mine_job_cpu(job, c, worker_id, backend)
+                found_nonce, tries, end_reason = mine_job_cpu(job, c, worker_id, backend)
             total_all += tries
+            update_local(job_end_reason=end_reason)
+            if found_nonce is None:
+                if end_reason == "range_exhausted":
+                    local_log(f"Job vollständig durchsucht: {tries:,} Nonces")
+                    try:
+                        heartbeat(c, worker_id, backend, job["job_id"], 0.0, tries, job.get("nonce_end"), status="range_done",
+                                  completed_batches=0, last_interval_hashes=0, last_interval_seconds=0.0)
+                    except Exception:
+                        pass
+                elif end_reason not in ("template_changed_or_stopped", "local_stop"):
+                    local_log(f"Job beendet: {end_reason}")
             if found_nonce is not None:
                 update_local(status=STATUS_FOUND, nonce=found_nonce)
                 local_log(f"GEFUNDEN {found_nonce}")
