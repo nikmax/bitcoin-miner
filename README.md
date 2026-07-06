@@ -11,7 +11,7 @@ cd worker
 cp config.example.json config.json
 
 anpassen: nano config.json
-  - Adresse deines Pools inkl. Port -> master_url
+  - Adresse deines(meines) Pools inkl. Port -> master_url
   - Deine Bitcoinadresse (wichtig!) -> worker_name
   - wenn du keine GPU hast          -> "use_gpu": false
 python3 worker.py
