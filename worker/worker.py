@@ -400,7 +400,7 @@ def mine_job_cpu(job, c, worker_id, backend):
             r = heartbeat(c, worker_id, backend, job["job_id"], 0.0, total, nonce, status="thermal_pause",
                           completed_batches=0, last_interval_hashes=0, last_interval_seconds=0.0)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total, "template_changed_or_stopped"
+                return None, total, "chain_tip_changed_or_stopped"
             last, last_total = time.time(), total
             continue
         end = min(nonce_end + 1, nonce + batch)
@@ -428,7 +428,7 @@ def mine_job_cpu(job, c, worker_id, backend):
             hr = interval_hashes / interval_seconds
             r = heartbeat(c, worker_id, backend, job["job_id"], hr, total, nonce, completed_batches=0, last_interval_hashes=interval_hashes, last_interval_seconds=interval_seconds)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total, "template_changed_or_stopped"
+                return None, total, "chain_tip_changed_or_stopped"
             # Progress is purely local UI data.
             span = max(1, nonce_end - nonce_start + 1)
             update_local(job_progress_percent=min(100.0, max(0.0, (nonce - nonce_start) / span * 100.0)), nonce_start=nonce_start, nonce_end=nonce_end)
@@ -452,7 +452,7 @@ def mine_job_gpu(job, c, worker_id, backend, hasher):
             r = heartbeat(c, worker_id, backend, job["job_id"], 0.0, total, nonce, status="thermal_pause",
                           completed_batches=completed_batches, last_interval_hashes=0, last_interval_seconds=0.0)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total, "template_changed_or_stopped"
+                return None, total, "chain_tip_changed_or_stopped"
             last, last_total = time.time(), total
             continue
         count = min(hasher.batch_size, nonce_end + 1 - nonce)
@@ -478,7 +478,7 @@ def mine_job_gpu(job, c, worker_id, backend, hasher):
             hr = interval_hashes / interval_seconds
             r = heartbeat(c, worker_id, backend, job["job_id"], hr, total, nonce, completed_batches=completed_batches, last_interval_hashes=interval_hashes, last_interval_seconds=interval_seconds)
             if not r.get("running") or r.get("template_id") != job.get("template_id"):
-                return None, total, "template_changed_or_stopped"
+                return None, total, "chain_tip_changed_or_stopped"
             # Progress is purely local UI data.
             span = max(1, nonce_end - nonce_start + 1)
             update_local(job_progress_percent=min(100.0, max(0.0, (nonce - nonce_start) / span * 100.0)), nonce_start=nonce_start, nonce_end=nonce_end)
@@ -777,7 +777,7 @@ def main():
                                   completed_batches=0, last_interval_hashes=0, last_interval_seconds=0.0)
                     except Exception:
                         pass
-                elif end_reason not in ("template_changed_or_stopped", "local_stop"):
+                elif end_reason not in ("chain_tip_changed_or_stopped", "local_stop"):
                     local_log(f"Job beendet: {end_reason}")
             if found_nonce is not None:
                 update_local(status=STATUS_FOUND, nonce=found_nonce)
