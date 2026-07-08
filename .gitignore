@@ -1,12 +1,5 @@
 config.json
-pool/config.json
-pool/logs/*
-
-shared/__pychache__
-pool/__pycache__
-pool/bitcoin/__pycache__
-pool/rounds/__pycache__
-pool/web/__pycache__
-pool/workers/__pycache__
+worker/config.json
+worker/__pycache__
+shared/__pycache__
 shared/kernels/__pycache__
-tools/__pycache__
